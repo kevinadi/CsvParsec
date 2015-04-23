@@ -1,5 +1,3 @@
---ghc -O2 CsvParser.hs && copy /y CsvParser.exe "C:\Users\Kevin\Desktop\Talent2 Data Import"
-
 import System.Environment
 import System.IO
 import Data.Ord
