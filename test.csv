@@ -1,0 +1,9 @@
+col1,col2,col3
+comma only,123456789,123456789
+"all col delimited","123456789","123456789"
+"first col, delimited",123456789,123456789
+mid col truncated,12345
+6789,123456789
+last col truncated,123456789,"12345
+6789"
+"delimiter" unreliable","123456789","123456789"

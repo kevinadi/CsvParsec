@@ -1,17 +1,16 @@
 import System.Environment
 import System.IO
+import Data.Either (either)
 import Data.Ord
 import Data.List
 import Data.Char
 import Data.Time
 import Data.Maybe
+import Control.Applicative ((<$>),(*>),(<*),(<*>),pure)
 import Control.Monad.State.Strict
 import Control.Monad.Reader
-
 import Text.Parsec
 import Text.Parsec.String  (Parser)
-import Data.Either         (either)
-import Control.Applicative ((<$>),(*>),(<*),(<*>),pure)
 
 
 --csv line parser
@@ -116,95 +115,108 @@ checkCsv str = fst . last $ sortBy (comparing snd) (procLength)
 ------------------------------------------------------------------                            
 
 
--- main loop using State - Reader - IO
+-- main loop
 ----------------------------------------------------------------------------
 doProcess :: [String] -> StateT ProcState (ReaderT Env IO) ProcState
 
 doProcess [] = do
-    ------- check if prevline can be parsed correctly
+    -- check if prevline can be parsed correctly
     env <- ask
     state <- get
-    case parse (parsec_line (csv env)) "" (prevline state) of
-        Right prevcols -> do
-            if (length prevcols == colcount env) 
-                then if (all (\x -> length x <= (maxcolen env)) prevcols)
-                    then do
-                        liftIO . hPutStrLn stdout $ outputCsv (out env) prevcols
-                        let longcol = longestCol prevcols
-                        if longcol > (longcolsize state)
-                            then put state { longcolline = (totallines state), longcolsize = longcol, prevline = "" }
-                            else put state { prevline = "" }
-                    else do
-                        liftIO . hPutStrLn stderr $ outputSQL (sqltable env) prevcols
-                        put state { prevline = "" }
-                else return ()
-        Left _ -> return ()
+    if (not.null) (prevline state)
+        then
+        case parse (parsec_line (csv env)) "" (prevline state) of
+            Right prevcols -> do
+                checkLongColumn prevcols
+                if (length prevcols == colcount env) 
+                    then if (all (\x -> length x <= (maxcolen env)) prevcols)
+                        then do
+                            processCleanLine prevcols
+                            put state { prevline = "" }
+                        else do
+                            liftIO . hPutStrLn stderr $ outputSQL (sqltable env) prevcols
+                            put state { prevline = "" }
+                    else return ()
+            Left _ -> return ()
+        else return ()
     get >>= return
 
 doProcess (x:xs) = do
 
-    ------- increment processed line count
+    -- increment processed line count
     modify (\state -> state { totallines = (totallines state)+1 })
 
     if (not.null) x then do
 
-        ------- check if prevline can be parsed correctly
+        -- check if prevline can be parsed correctly
         doProcess []
 
-        ------- get current state & env
         env <- ask
         state <- get
 
-        ------- if debug is set
+        -- if debug is set
         if debug env
             then liftIO . hPutStrLn stderr $ "--" ++ show (totallines state) ++ ": " ++ x
             else return ()
 
-        ------- get current line
-        case parse (parsec_line (csv env)) "" x of
-
-            Right cols -> do
-
-                let longcol = longestCol cols
-                if longcol > (longcolsize state)
-                    then put state { longcolline = (totallines state), longcolsize = longcol }
-                    else return ()
-
-                ------- process current line
-                if (all (\x -> length x <= (maxcolen env)) cols) && (length cols == colcount env)
-
-                    ------- output clean lines: csv or sql ==> output line
-                    then if (sql env)
-                        then liftIO . hPutStrLn stdout $ outputSQL (sqltable env) cols
-                        else liftIO . hPutStrLn stdout $ outputCsv (out env) cols  --x
-
-                    ------- process dirty lines
-                    else do
-
-                        ------- check if delimiter count is unreliable
-                        (cs,ds) <- asks csv
-                        let corruptCol = splitStr [ds,cs,ds] (tail . init $ x)
-                        if length corruptCol == colcount env
-
-                            ------- column count is correct, delimiter is unreliable ==> output line
-                            then liftIO . hPutStrLn stderr $ outputSQL (sqltable env) corruptCol
-
-                            ------- column count is wrong : truncated line ==> save line into (prevline state)
-                            else do
-                                let xfilt = filter (/='\r') . filter (/='\n') $ x
-                                put state { prevline = (prevline state) ++ xfilt }
-
-            Left _ -> do
-                let xfilt = filter (/='\r') . filter (/='\n') $ x
-                put state { prevline = (prevline state) ++ xfilt }
+        -- get current line
+        parseCurrentLine x
 
     else do
         state <- get
         liftIO . hPutStrLn stderr $ "--Empty line on " ++ show (totallines state)
 
     doProcess xs
-----------------------------------------------------------------------------
 
+
+parseCurrentLine :: String -> StateT ProcState (ReaderT Env IO) ()
+parseCurrentLine line = do
+    env <- ask
+    state <- get
+    case parse (parsec_line (csv env)) "" line of
+
+        Right cols -> do
+            checkLongColumn cols
+            if (all (\x -> length x <= (maxcolen env)) cols) && (length cols == colcount env)
+                then processCleanLine cols
+                else processDirtyLine line
+
+        Left _ -> do
+            let xfilt = filter (/='\r') . filter (/='\n') $ line
+            put state { prevline = (prevline state) ++ xfilt }
+
+checkLongColumn :: [String] -> StateT ProcState (ReaderT Env IO) ()
+checkLongColumn cols = do
+    state <- get
+    let longcol = longestCol cols
+    if longcol > (longcolsize state)
+        then put state { longcolline = (totallines state), longcolsize = longcol }
+        else return ()
+
+processCleanLine :: [String] -> StateT ProcState (ReaderT Env IO) ()
+processCleanLine cols = do
+    checkLongColumn cols
+    env <- ask
+    state <- get
+    put state { prevline = "" }
+    if (sql env)
+        then liftIO . hPutStrLn stdout $ outputSQL (sqltable env) cols
+        else liftIO . hPutStrLn stdout $ outputCsv (out env) cols
+
+processDirtyLine :: String -> StateT ProcState (ReaderT Env IO) ()
+processDirtyLine line = do
+    state <- get
+    env <- ask
+    (cs,ds) <- asks csv
+    let corruptCol = splitStr [ds,cs,ds] (tail . init $ line)
+    if length corruptCol == colcount env
+        -- column count is correct, delimiter is unreliable ==> output line as SQL
+        then liftIO . hPutStrLn stderr $ outputSQL (sqltable env) corruptCol
+        -- column count is wrong : truncated line ==> save line into (prevline state)
+        else do
+            let xfilt = filter (/='\r') . filter (/='\n') $ line
+            put state { prevline = (prevline state) ++ xfilt }
+----------------------------------------------------------------------------
 
 
 -- reader monad environment
@@ -277,7 +289,6 @@ main = do
             let initialenv = Env {
                 csv      = checkCsv (head contentLines),
                 out      = ('|','~'),
-                --out = (',','"'),
                 maxcolen = 3000,
                 sql      = elem "-sql" args,
                 sqltable = argProcess "-t" args,
