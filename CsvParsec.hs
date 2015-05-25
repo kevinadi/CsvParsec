@@ -26,8 +26,15 @@ parsec_line (cs,ds) = sepBy (parsec_quotedcell (cs,ds) <|> parsec_unquotedcell (
 
 parseCsv :: (Char,Char) -> String -> [String]
 parseCsv (cs,ds) = either (const []) id . parse (parsec_line (cs,ds)) ""
+
+alternateParser :: (Char,Char) -> Int -> String -> Maybe [String]
+alternateParser (cs,ds) colcount line =
+    if length cols == colcount && head line == ds && last line == ds
+        then Just cols
+        else Nothing
+    where cols = splitStr [ds,cs,ds] . tail . init $ line
 ------------------------------------------------------------------
-    
+
 
 --helpers
 ------------------------------------------------------------------
@@ -44,7 +51,11 @@ longestCol :: [String] -> Int
 longestCol l = if length l > 0
     then length . maximumBy (comparing length) $ l
     else 0
-------------------------------------------------------------------    
+
+
+filterLine :: String -> String
+filterLine = filter (/='\r') . filter (/='\n')
+------------------------------------------------------------------
 
 
 --outputs
@@ -76,7 +87,7 @@ printState state = "--Processed line: " ++ show (totallines state) ++ "\n"
                    ++ "--Longest column size: " ++  show (longcolsize state)
                    ++ " on line " ++ show (longcolline state) ++ "\n"
                    ++ "--Last line: " ++ (if null (prevline state) then "Empty" else (prevline state))
-------------------------------------------------------------------                
+------------------------------------------------------------------
 
 
 --IO stdin/file
@@ -93,7 +104,7 @@ getInputFileContent args =
                 hSetBuffering fileHandle . BlockBuffering . Just $ 1024*10
                 hSetEncoding fileHandle utf8
                 getContents fileHandle
-------------------------------------------------------------------                
+------------------------------------------------------------------
 
 
 --initial environment checks
@@ -101,89 +112,57 @@ getInputFileContent args =
 checkCsv :: String -> (Char,Char)
 checkCsv str = fst . last $ sortBy (comparing snd) (procLength)
     where testenv = [ Env { csv = (',','"'), out = (',','"'), maxcolen = 0,
-                        sql = False, sqltable = "", colcount = 0, debug = False }
+                        sql = False, sqltable = "", colcount = 0 }
                     , Env { csv = ('|','~'), out = ('|','~'), maxcolen = 0,
-                        sql = False, sqltable = "", colcount = 0, debug = False }
+                        sql = False, sqltable = "", colcount = 0 }
                     , Env { csv = ('|','"'), out = ('|','~'), maxcolen = 0,
-                        sql = False, sqltable = "", colcount = 0, debug = False }
+                        sql = False, sqltable = "", colcount = 0 }
                     ]
           procLength = map (\envs ->
                             (csv envs,
                             (length $ parseCsv (csv envs) str) +
                             (length $ filter (==snd (csv envs)) str) ))
                             testenv
-------------------------------------------------------------------                            
+------------------------------------------------------------------
 
 
 -- main loop
 ----------------------------------------------------------------------------
-doProcess :: [String] -> StateT ProcState (ReaderT Env IO) ProcState
+doProcess :: [String] -> StateT ProcState (ReaderT Env IO) ()
 
 doProcess [] = do
-    -- check if prevline can be parsed correctly
-    env <- ask
     state <- get
     if (not.null) (prevline state)
-        then
-        case parse (parsec_line (csv env)) "" (prevline state) of
-            Right prevcols -> do
-                checkLongColumn prevcols
-                if (length prevcols == colcount env) 
-                    then if (all (\x -> length x <= (maxcolen env)) prevcols)
-                        then do
-                            processCleanLine prevcols
-                            put state { prevline = "" }
-                        else do
-                            liftIO . hPutStrLn stderr $ outputSQL (sqltable env) prevcols
-                            put state { prevline = "" }
-                    else return ()
-            Left _ -> return ()
+        then parseLine (prevline state)
         else return ()
-    get >>= return
 
-doProcess (x:xs) = do
+doProcess ([]:rest) = do
+    state <- get
+    put state { totallines = (totallines state)+1 }
+    liftIO . hPutStrLn stderr $ "--Empty line on " ++ show (totallines state)
+    doProcess rest
 
-    -- increment processed line count
-    modify (\state -> state { totallines = (totallines state)+1 })
-
-    if (not.null) x then do
-
-        -- check if prevline can be parsed correctly
-        doProcess []
-
-        env <- ask
-        state <- get
-
-        -- if debug is set
-        if debug env
-            then liftIO . hPutStrLn stderr $ "--" ++ show (totallines state) ++ ": " ++ x
-            else return ()
-
-        -- get current line
-        parseCurrentLine x
-
-    else do
-        state <- get
-        liftIO . hPutStrLn stderr $ "--Empty line on " ++ show (totallines state)
-
-    doProcess xs
+doProcess (line:rest) = do
+    state <- get
+    put state { totallines = (totallines state)+1 }
+    parseLine $ (prevline state) ++ line
+    doProcess rest
 
 
-parseCurrentLine :: String -> StateT ProcState (ReaderT Env IO) ()
-parseCurrentLine line = do
+parseLine :: String -> StateT ProcState (ReaderT Env IO) ()
+parseLine line = do
     env <- ask
     state <- get
     case parse (parsec_line (csv env)) "" line of
-
         Right cols -> do
-            checkLongColumn cols
-            if (all (\x -> length x <= (maxcolen env)) cols) && (length cols == colcount env)
-                then processCleanLine cols
+            if length cols == colcount env
+                then do
+                    checkLongColumn cols
+                    if (all (\x -> length x <= (maxcolen env)) cols)
+                        then processCleanLine cols
+                        else liftIO . hPutStrLn stdout $ outputSQL (sqltable env) cols
                 else processDirtyLine line
-
-        Left _ -> do
-            let xfilt = filter (/='\r') . filter (/='\n') $ line
-            put state { prevline = (prevline state) ++ xfilt }
+        Left _ -> put state { prevline = filterLine line }
 
 checkLongColumn :: [String] -> StateT ProcState (ReaderT Env IO) ()
 checkLongColumn cols = do
@@ -195,10 +174,8 @@ checkLongColumn cols = do
 
 processCleanLine :: [String] -> StateT ProcState (ReaderT Env IO) ()
 processCleanLine cols = do
-    checkLongColumn cols
+    modify (\state -> state { prevline = "" })
     env <- ask
-    state <- get
-    put state { prevline = "" }
     if (sql env)
         then liftIO . hPutStrLn stdout $ outputSQL (sqltable env) cols
         else liftIO . hPutStrLn stdout $ outputCsv (out env) cols
@@ -207,15 +184,11 @@ processDirtyLine :: String -> StateT ProcState (ReaderT Env IO) ()
 processDirtyLine line = do
     state <- get
     env <- ask
-    (cs,ds) <- asks csv
-    let corruptCol = splitStr [ds,cs,ds] (tail . init $ line)
-    if length corruptCol == colcount env
-        -- column count is correct, delimiter is unreliable ==> output line as SQL
-        then liftIO . hPutStrLn stderr $ outputSQL (sqltable env) corruptCol
-        -- column count is wrong : truncated line ==> save line into (prevline state)
-        else do
-            let xfilt = filter (/='\r') . filter (/='\n') $ line
-            put state { prevline = (prevline state) ++ xfilt }
+    case alternateParser (csv env) (colcount env) line of
+        Just cols -> do
+            liftIO . hPutStrLn stderr $ outputSQL (sqltable env) cols
+            put state { prevline = "" }
+        Nothing -> put state { prevline = filterLine line }
 ----------------------------------------------------------------------------
 
 
@@ -228,7 +201,6 @@ data Env = Env
     , sql      :: Bool
     , sqltable :: String
     , colcount :: Int
-    , debug    :: Bool
     } deriving Show
 ----------------------------------------------------------------------------
 
@@ -277,7 +249,7 @@ main = do
     args <- getArgs
 
     if length args == 0
-        then putStrLn "CsvParser [-d|input_file] -t[table_name] [-sql] [--debug] 1>[cleaned_output] 2>[errors]"
+        then putStrLn "CsvParsec [-d|input_file] -t[table_name] [-sql] 1>[cleaned_output] 2>[errors]"
         else do
 
             start <- getCurrentTime
@@ -292,8 +264,7 @@ main = do
                 maxcolen = 3000,
                 sql      = elem "-sql" args,
                 sqltable = argProcess "-t" args,
-                colcount = 0,
-                debug    = elem "--debug" args
+                colcount = 0
             }
 
             let headercols = parseCsv (csv initialenv) (head contentLines)
@@ -309,7 +280,7 @@ main = do
                 longcolsize = 0,
                 prevline    = ""
             }
-            finalState <- flip runReaderT env . flip evalStateT state . doProcess $ tail contentLines
+            finalState <- flip runReaderT env . flip execStateT state . doProcess $ tail contentLines
 
             hPutStrLn stderr "-------------------------------"
             hPutStrLn stderr $ printState finalState
